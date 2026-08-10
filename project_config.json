@@ -1,0 +1,8 @@
+{
+    "project_name": "LegisBrief-NLP",
+    "random_seed": 42,
+    "dataset_id": "FiscalNote/billsum",
+    "tokenizer_name": "google-t5/t5-small",
+    "maximum_input_tokens": 1024,
+    "maximum_target_tokens": 512
+}

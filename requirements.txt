@@ -1,0 +1,13 @@
+streamlit==1.49.1
+torch>=2.6,<3
+transformers==5.14.1
+sentence-transformers==5.6.1
+huggingface_hub
+faiss-cpu==1.14.3
+scikit-learn==1.9.0
+scipy>=1.15,<2
+pandas>=2.2,<3
+numpy>=2.0,<3
+joblib>=1.4,<2
+sentencepiece==0.2.2
+spacy==3.8.7

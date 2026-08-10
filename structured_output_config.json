@@ -1,0 +1,10 @@
+{
+    "plain_english_method": "Fixed legal-language glossary, citation cleanup, sentence splitting, and length limits",
+    "key_policy_changes_method": "Rule-based sentence ranking with policy-action patterns and duplicate removal",
+    "affected_groups_method": "Stakeholder dictionary, public-body patterns, and role phrases before legal action words",
+    "maximum_policy_changes": 5,
+    "maximum_affected_groups": 8,
+    "default_similar_bills": 5,
+    "disclaimer": "This output is for informational purposes only and is not legal advice.",
+    "direct_supervision_note": "BillSum directly supervises the main summary only. The structured fields use transparent post-processing."
+}
