@@ -1,0 +1,14 @@
+models/
+artifacts/
+data/
+
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+.venv/
+venv/
+
+.env
+.streamlit/secrets.toml
