@@ -1,4 +1,3 @@
-# Final generalized grounded pipeline for LegisBrief-NLP.
 
 import gc
 import json
@@ -2505,6 +2504,22 @@ class LegisBriefPipeline:
         self,
         policy_change_df
     ):
+        """
+        Extract only plausible legal actors from policy
+        provisions. This is deliberately general: it uses
+        grammatical roles instead of a fixed stakeholder
+        dictionary.
+
+        Candidates come from:
+        - grammatical subjects of policy actions;
+        - objects of actor-bearing prepositions such as
+          to, against, by, from, for, on, and upon;
+        - named PERSON/ORG/GPE/NORP entities.
+
+        Abstract objects such as "training", "penalties",
+        "violations", and "requirements" are therefore
+        much less likely to become stakeholder candidates.
+        """
         if (
             policy_change_df is None
             or policy_change_df.empty
@@ -2517,25 +2532,76 @@ class LegisBriefPipeline:
             "PERSON",
             "ORG",
             "GPE",
-            "NORP",
-            "FAC"
+            "NORP"
         }
 
-        allowed_dependencies = {
-            "nsubj",
-            "nsubjpass",
-            "dobj",
-            "obj",
-            "pobj",
-            "agent",
-            "attr",
-            "oprd",
-            "dative"
+        actor_prepositions = {
+            "to",
+            "against",
+            "by",
+            "from",
+            "for",
+            "on",
+            "upon",
+            "with"
         }
+
+        subject_dependencies = {
+            "nsubj",
+            "nsubjpass"
+        }
+
+        def clean_phrase(
+            phrase
+        ):
+            phrase = self.normalize_text(
+                phrase
+            )
+
+            phrase = re.sub(
+                r"^(?:the|a|an)\s+",
+                "",
+                phrase,
+                flags=re.IGNORECASE
+            ).strip(
+                " ,.;:-"
+            )
+
+            return phrase
+
+        def subtree_phrase(
+            token
+        ):
+            subtree_tokens = [
+                subtree_token
+                for subtree_token
+                in token.subtree
+                if not subtree_token.is_punct
+            ]
+
+            if not subtree_tokens:
+                return token.text
+
+            start_index = min(
+                subtree_token.i
+                for subtree_token
+                in subtree_tokens
+            )
+
+            end_index = max(
+                subtree_token.i
+                for subtree_token
+                in subtree_tokens
+            )
+
+            return token.doc[
+                start_index:
+                end_index + 1
+            ].text
 
         for context_rank, row in enumerate(
             policy_change_df.head(
-                10
+                12
             ).itertuples(
                 index=False
             )
@@ -2550,50 +2616,120 @@ class LegisBriefPipeline:
                 )
             )
 
-            phrases = []
+            phrase_sources = []
 
+            # Named actors are useful even when dependency
+            # parsing is imperfect.
             for entity in document.ents:
                 if (
                     entity.label_
                     in allowed_entity_labels
                 ):
-                    phrases.append(
-                        entity.text
+                    phrase_sources.append(
+                        (
+                            entity.text,
+                            "named_entity"
+                        )
                     )
 
-            for noun_chunk in (
-                document.noun_chunks
-            ):
+            # Subjects are the strongest general indicator
+            # of who has a duty, right, authority, or
+            # restriction in a legal provision.
+            for token in document:
+                if (
+                    token.dep_
+                    in subject_dependencies
+                    and token.pos_
+                    in {
+                        "NOUN",
+                        "PROPN"
+                    }
+                ):
+                    phrase_sources.append(
+                        (
+                            subtree_phrase(
+                                token
+                            ),
+                            "grammatical_subject"
+                        )
+                    )
+
+            # Beneficiaries, regulated parties, and targets
+            # frequently occur as objects of these
+            # prepositions: "to employees", "against an
+            # employee", "on an employer", "by the agency".
+            for token in document:
+                if (
+                    token.dep_
+                    == "pobj"
+                    and token.pos_
+                    in {
+                        "NOUN",
+                        "PROPN"
+                    }
+                    and token.head.pos_
+                    == "ADP"
+                    and token.head.lemma_
+                    .casefold()
+                    in actor_prepositions
+                ):
+                    phrase_sources.append(
+                        (
+                            subtree_phrase(
+                                token
+                            ),
+                            "actor_prepositional_object"
+                        )
+                    )
+
+            # Direct/indirect objects are retained only
+            # when spaCy identifies the head as a named
+            # entity or person/organization noun phrase;
+            # the NLI actor test below remains the final
+            # semantic gate.
+            for noun_chunk in document.noun_chunks:
                 root = noun_chunk.root
 
                 if (
                     root.dep_
-                    in allowed_dependencies
+                    in {
+                        "dobj",
+                        "obj",
+                        "iobj",
+                        "dative",
+                        "agent"
+                    }
                     and root.pos_
                     in {
                         "NOUN",
-                        "PROPN",
-                        "PRON"
+                        "PROPN"
                     }
                 ):
-                    phrases.append(
-                        noun_chunk.text
-                    )
+                    entity_labels = {
+                        token.ent_type_
+                        for token
+                        in noun_chunk
+                        if token.ent_type_
+                    }
 
-            for phrase in phrases:
-                phrase = (
-                    self.normalize_text(
-                        phrase
-                    )
-                )
+                    if (
+                        entity_labels
+                        & allowed_entity_labels
+                    ):
+                        phrase_sources.append(
+                            (
+                                noun_chunk.text,
+                                "named_object"
+                            )
+                        )
 
-                phrase = re.sub(
-                    r"^(?:the|a|an)\s+",
-                    "",
-                    phrase,
-                    flags=re.IGNORECASE
-                ).strip(
-                    " ,.;:-"
+            seen_in_context = set()
+
+            for phrase, source_type in (
+                phrase_sources
+            ):
+                phrase = clean_phrase(
+                    phrase
                 )
 
                 if (
@@ -2608,6 +2744,8 @@ class LegisBriefPipeline:
                 ):
                     continue
 
+                # Pronouns and legal-document references
+                # are not useful stakeholder labels.
                 if (
                     phrase.casefold()
                     in {
@@ -2615,6 +2753,9 @@ class LegisBriefPipeline:
                         "they",
                         "he",
                         "she",
+                        "who",
+                        "whom",
+                        "whose",
                         "this",
                         "that",
                         "this act",
@@ -2627,6 +2768,23 @@ class LegisBriefPipeline:
                 ):
                     continue
 
+                phrase_key = re.sub(
+                    r"[^a-z0-9]+",
+                    " ",
+                    phrase.casefold()
+                ).strip()
+
+                if (
+                    not phrase_key
+                    or phrase_key
+                    in seen_in_context
+                ):
+                    continue
+
+                seen_in_context.add(
+                    phrase_key
+                )
+
                 candidate_rows.append(
                     {
                         "candidate": (
@@ -2637,12 +2795,14 @@ class LegisBriefPipeline:
                         ),
                         "context_rank": (
                             context_rank
+                        ),
+                        "candidate_source": (
+                            source_type
                         )
                     }
                 )
 
         unique_rows = []
-
         seen_pairs = set()
 
         for row in candidate_rows:
@@ -2774,10 +2934,10 @@ class LegisBriefPipeline:
 
             if (
                 stakeholder_score
-                >= 0.40
+                >= 0.50
                 and stakeholder_score
                 >= abstract_score
-                + 0.03
+                + 0.08
             ):
                 accepted_candidates.append(
                     {
@@ -2911,7 +3071,7 @@ class LegisBriefPipeline:
             )
             if row[
                 "role_score"
-            ] >= 0.42
+            ] >= 0.48
         ]
 
         ranked.sort(
@@ -2933,6 +3093,43 @@ class LegisBriefPipeline:
             )
         )
 
+        def stakeholder_key(
+            phrase
+        ):
+            document = (
+                self.language_processor(
+                    phrase
+                )
+            )
+
+            key_tokens = []
+
+            for token in document:
+                if (
+                    token.is_punct
+                    or token.is_space
+                    or token.pos_
+                    in {
+                        "DET"
+                    }
+                ):
+                    continue
+
+                lemma = (
+                    token.lemma_
+                    .casefold()
+                    .strip()
+                )
+
+                if lemma:
+                    key_tokens.append(
+                        lemma
+                    )
+
+            return " ".join(
+                key_tokens
+            ).strip()
+
         selected = []
 
         for row in ranked:
@@ -2940,22 +3137,22 @@ class LegisBriefPipeline:
                 "candidate"
             ]
 
-            candidate_key = re.sub(
-                r"[^a-z0-9]+",
-                " ",
-                candidate.casefold()
-            ).strip()
+            candidate_key = (
+                stakeholder_key(
+                    candidate
+                )
+            )
 
             duplicate = False
 
             for existing in selected:
-                existing_key = re.sub(
-                    r"[^a-z0-9]+",
-                    " ",
-                    existing[
-                        "affected_group"
-                    ].casefold()
-                ).strip()
+                existing_key = (
+                    stakeholder_key(
+                        existing[
+                            "affected_group"
+                        ]
+                    )
+                )
 
                 if (
                     candidate_key
@@ -3582,7 +3779,7 @@ class LegisBriefPipeline:
             ),
             "generation_metadata": {
                 "pipeline_revision": (
-                    "source_grounded_v3"
+                    "source_grounded_v4"
                 ),
                 "bill_chunks": int(
                     draft_result[
