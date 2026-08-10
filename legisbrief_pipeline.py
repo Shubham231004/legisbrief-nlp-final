@@ -1,4 +1,3 @@
-
 import gc
 import json
 import re
@@ -1705,7 +1704,7 @@ class LegisBriefPipeline:
                     -policy_similarity[
                         candidate_index
                     ]
-                )[:2]
+                )[:3]
             )
 
             best_non_policy_index = int(
@@ -1992,16 +1991,16 @@ class LegisBriefPipeline:
                 (
                     complete_clause
                     and policy_entailment
-                    >= 0.40
+                    >= 0.34
                     and non_policy_entailment
                     <= policy_entailment
-                    + 0.08
+                    + 0.12
                 )
                 or (
                     policy_entailment
-                    >= 0.62
+                    >= 0.55
                     and non_policy_entailment
-                    < 0.62
+                    < 0.65
                 )
             )
 
@@ -2084,141 +2083,357 @@ class LegisBriefPipeline:
         minimum_items=3,
         maximum_items=5
     ):
+        """
+        Select policy provisions using coverage-aware
+        maximal marginal relevance.
+
+        The selection balances:
+        - NLI/semantic policy importance;
+        - legislative-function diversity;
+        - coverage across different parts of the bill;
+        - redundancy avoidance.
+
+        This is general legislative logic and does not
+        contain bill-specific keywords or stakeholder
+        lists.
+        """
         if (
             policy_df is None
             or policy_df.empty
         ):
             return pd.DataFrame()
 
-        ranked = (
+        strict = (
             policy_df.loc[
                 policy_df[
                     "is_policy"
                 ]
             ]
-            .sort_values(
-                "selection_score",
-                ascending=False
-            )
-            .reset_index(
-                drop=True
-            )
+            .copy()
         )
 
-        if len(ranked) < minimum_items:
-            relaxed = (
-                policy_df.loc[
-                    (
-                        policy_df[
-                            "complete_clause"
-                        ]
-                    )
-                    & (
+        relaxed = (
+            policy_df.loc[
+                (
+                    policy_df[
+                        "complete_clause"
+                    ]
+                )
+                & (
+                    policy_df[
+                        "policy_entailment"
+                    ]
+                    >= 0.28
+                )
+                & (
+                    policy_df[
+                        "non_policy_entailment"
+                    ]
+                    <= (
                         policy_df[
                             "policy_entailment"
                         ]
-                        >= 0.30
+                        + 0.16
                     )
-                    & (
-                        policy_df[
-                            "non_policy_entailment"
-                        ]
-                        < 0.62
-                    )
-                ]
-                .sort_values(
-                    "selection_score",
-                    ascending=False
                 )
-            )
-
-            ranked = (
-                pd.concat(
-                    [
-                        ranked,
-                        relaxed
-                    ],
-                    ignore_index=True
-                )
-                .drop_duplicates(
-                    subset=[
-                        "source_sentence"
+                & (
+                    policy_df[
+                        "non_policy_entailment"
                     ]
+                    < 0.68
                 )
-                .sort_values(
-                    "selection_score",
-                    ascending=False
-                )
-                .reset_index(
-                    drop=True
-                )
+            ]
+            .copy()
+        )
+
+        ranked = (
+            pd.concat(
+                [
+                    strict,
+                    relaxed
+                ],
+                ignore_index=True
             )
+            .drop_duplicates(
+                subset=[
+                    "source_sentence"
+                ]
+            )
+        )
+
+        if ranked.empty:
+            return pd.DataFrame()
+
+        score_min = float(
+            ranked[
+                "selection_score"
+            ].min()
+        )
+
+        score_max = float(
+            ranked[
+                "selection_score"
+            ].max()
+        )
+
+        score_range = max(
+            1e-6,
+            score_max - score_min
+        )
+
+        position_min = float(
+            ranked[
+                "sentence_position"
+            ].min()
+        )
+
+        position_max = float(
+            ranked[
+                "sentence_position"
+            ].max()
+        )
+
+        position_range = max(
+            1.0,
+            position_max - position_min
+        )
+
+        ranked = ranked.copy()
+
+        ranked[
+            "_normalized_score"
+        ] = (
+            ranked[
+                "selection_score"
+            ]
+            - score_min
+        ) / score_range
 
         selected_rows = []
         selected_sentences = []
-        function_counts = Counter()
+        selected_positions = []
+        selected_functions = Counter()
 
-        for pass_name in [
-            "new_function",
-            "fill"
-        ]:
-            for row in (
-                ranked.itertuples(
-                    index=False
-                )
+        candidate_records = (
+            ranked.to_dict(
+                orient="records"
+            )
+        )
+
+        while (
+            candidate_records
+            and len(
+                selected_rows
+            )
+            < maximum_items
+        ):
+            best_index = None
+            best_value = None
+
+            for candidate_index, candidate in enumerate(
+                candidate_records
             ):
-                sentence = (
-                    row.source_sentence
+                sentence = str(
+                    candidate[
+                        "source_sentence"
+                    ]
                 )
 
                 if any(
                     self.sentence_jaccard(
                         sentence,
-                        existing
+                        existing_sentence
                     )
                     >= 0.64
-                    for existing in (
-                        selected_sentences
-                    )
+                    for existing_sentence
+                    in selected_sentences
                 ):
                     continue
+
+                base_score = float(
+                    candidate[
+                        "_normalized_score"
+                    ]
+                )
+
+                function_name = str(
+                    candidate[
+                        "policy_function"
+                    ]
+                )
+
+                function_novelty = (
+                    1.0
+                    if selected_functions[
+                        function_name
+                    ] == 0
+                    else (
+                        0.35
+                        if selected_functions[
+                            function_name
+                        ] == 1
+                        else 0.0
+                    )
+                )
+
+                position = float(
+                    candidate[
+                        "sentence_position"
+                    ]
+                )
+
+                if not selected_positions:
+                    position_novelty = 1.0
+
+                else:
+                    position_novelty = min(
+                        1.0,
+                        min(
+                            abs(
+                                position
+                                - existing_position
+                            )
+                            / position_range
+                            for existing_position
+                            in selected_positions
+                        )
+                        * 2.5
+                    )
+
+                redundancy = (
+                    max(
+                        [
+                            self.sentence_jaccard(
+                                sentence,
+                                existing_sentence
+                            )
+                            for existing_sentence
+                            in selected_sentences
+                        ],
+                        default=0.0
+                    )
+                )
+
+                selection_value = (
+                    0.58
+                    * base_score
+                    + 0.22
+                    * function_novelty
+                    + 0.20
+                    * position_novelty
+                    - 0.18
+                    * redundancy
+                )
 
                 if (
-                    pass_name
-                    == "new_function"
-                    and function_counts[
-                        row.policy_function
-                    ] > 0
+                    best_value is None
+                    or selection_value
+                    > best_value
+                ):
+                    best_value = (
+                        selection_value
+                    )
+
+                    best_index = (
+                        candidate_index
+                    )
+
+            if best_index is None:
+                break
+
+            chosen = (
+                candidate_records.pop(
+                    best_index
+                )
+            )
+
+            chosen.pop(
+                "_normalized_score",
+                None
+            )
+
+            selected_rows.append(
+                chosen
+            )
+
+            selected_sentences.append(
+                str(
+                    chosen[
+                        "source_sentence"
+                    ]
+                )
+            )
+
+            selected_positions.append(
+                float(
+                    chosen[
+                        "sentence_position"
+                    ]
+                )
+            )
+
+            selected_functions[
+                str(
+                    chosen[
+                        "policy_function"
+                    ]
+                )
+            ] += 1
+
+        if (
+            len(
+                selected_rows
+            )
+            < minimum_items
+        ):
+            remaining = (
+                ranked.sort_values(
+                    "selection_score",
+                    ascending=False
+                )
+                .to_dict(
+                    orient="records"
+                )
+            )
+
+            for candidate in remaining:
+                sentence = str(
+                    candidate[
+                        "source_sentence"
+                    ]
+                )
+
+                if any(
+                    self.sentence_jaccard(
+                        sentence,
+                        existing_sentence
+                    )
+                    >= 0.64
+                    for existing_sentence
+                    in selected_sentences
                 ):
                     continue
 
+                candidate.pop(
+                    "_normalized_score",
+                    None
+                )
+
                 selected_rows.append(
-                    row._asdict()
+                    candidate
                 )
 
                 selected_sentences.append(
                     sentence
                 )
 
-                function_counts[
-                    row.policy_function
-                ] += 1
-
                 if (
                     len(
                         selected_rows
                     )
-                    >= maximum_items
+                    >= minimum_items
                 ):
                     break
-
-            if (
-                len(
-                    selected_rows
-                )
-                >= maximum_items
-            ):
-                break
 
         return pd.DataFrame(
             selected_rows
@@ -2390,6 +2605,27 @@ class LegisBriefPipeline:
         policy_df,
         summary_policy_df
     ):
+        """
+        Build a broad but non-redundant policy-change
+        list. Unlike the summary, this section is allowed
+        to include up to seven provisions so deadlines,
+        funding, eligibility, enforcement, and reporting
+        provisions are not lost simply because they did
+        not fit in the shorter summary.
+        """
+        broad_policy_df = (
+            self._select_diverse_policy_rows(
+                policy_df=policy_df,
+                minimum_items=min(
+                    4,
+                    self.maximum_policy_changes
+                ),
+                maximum_items=(
+                    self.maximum_policy_changes
+                )
+            )
+        )
+
         rows = []
 
         if (
@@ -2403,27 +2639,17 @@ class LegisBriefPipeline:
             )
 
         if (
-            policy_df is not None
-            and not policy_df.empty
+            broad_policy_df is not None
+            and not broad_policy_df.empty
         ):
             rows.extend(
-                policy_df.loc[
-                    policy_df[
-                        "is_policy"
-                    ]
-                ]
-                .sort_values(
-                    "selection_score",
-                    ascending=False
-                )
-                .to_dict(
+                broad_policy_df.to_dict(
                     orient="records"
                 )
             )
 
         selected = []
         selected_sentences = []
-        functions = Counter()
 
         for row in rows:
             sentence = (
@@ -2437,28 +2663,11 @@ class LegisBriefPipeline:
             if any(
                 self.sentence_jaccard(
                     sentence,
-                    existing
+                    existing_sentence
                 )
                 >= 0.64
-                for existing
+                for existing_sentence
                 in selected_sentences
-            ):
-                continue
-
-            policy_function = str(
-                row.get(
-                    "policy_function",
-                    "Policy change"
-                )
-            )
-
-            # Prefer function diversity first, but
-            # allow a second provision from the same
-            # function when it adds distinct content.
-            if (
-                functions[
-                    policy_function
-                ] >= 2
             ):
                 continue
 
@@ -2467,16 +2676,31 @@ class LegisBriefPipeline:
                     "policy_change": (
                         sentence
                     ),
-                    "policy_function": (
-                        policy_function
+                    "policy_function": str(
+                        row.get(
+                            "policy_function",
+                            "Policy change"
+                        )
                     ),
                     "source_sentence": (
                         sentence
+                    ),
+                    "sentence_position": int(
+                        row.get(
+                            "sentence_position",
+                            0
+                        )
                     ),
                     "support_score": float(
                         row.get(
                             "policy_entailment",
                             1.0
+                        )
+                    ),
+                    "selection_score": float(
+                        row.get(
+                            "selection_score",
+                            0.0
                         )
                     )
                 }
@@ -2485,10 +2709,6 @@ class LegisBriefPipeline:
             selected_sentences.append(
                 sentence
             )
-
-            functions[
-                policy_function
-            ] += 1
 
             if (
                 len(selected)
@@ -2502,27 +2722,21 @@ class LegisBriefPipeline:
 
     def _collect_stakeholder_candidates(
         self,
-        policy_change_df
+        policy_context_df
     ):
         """
-        Extract only plausible legal actors from policy
-        provisions. This is deliberately general: it uses
-        grammatical roles instead of a fixed stakeholder
-        dictionary.
+        Generate stakeholder candidates from verified
+        policy provisions using grammatical actor
+        positions, entity recognition, coordination, and
+        noun-phrase structure.
 
-        Candidates come from:
-        - grammatical subjects of policy actions;
-        - objects of actor-bearing prepositions such as
-          to, against, by, from, for, on, and upon;
-        - named PERSON/ORG/GPE/NORP entities.
-
-        Abstract objects such as "training", "penalties",
-        "violations", and "requirements" are therefore
-        much less likely to become stakeholder candidates.
+        The NLI actor/role classifier remains the semantic
+        gate, so direct objects may be considered without
+        maintaining a static list of stakeholder types.
         """
         if (
-            policy_change_df is None
-            or policy_change_df.empty
+            policy_context_df is None
+            or policy_context_df.empty
         ):
             return []
 
@@ -2543,12 +2757,22 @@ class LegisBriefPipeline:
             "for",
             "on",
             "upon",
-            "with"
+            "with",
+            "among",
+            "between"
         }
 
         subject_dependencies = {
             "nsubj",
             "nsubjpass"
+        }
+
+        object_dependencies = {
+            "dobj",
+            "obj",
+            "iobj",
+            "dative",
+            "oprd"
         }
 
         def clean_phrase(
@@ -2569,39 +2793,146 @@ class LegisBriefPipeline:
 
             return phrase
 
-        def subtree_phrase(
-            token
+        def noun_chunk_for_token(
+            document,
+            target_token
         ):
-            subtree_tokens = [
-                subtree_token
-                for subtree_token
-                in token.subtree
-                if not subtree_token.is_punct
+            for noun_chunk in (
+                document.noun_chunks
+            ):
+                if (
+                    noun_chunk.start
+                    <= target_token.i
+                    < noun_chunk.end
+                ):
+                    return noun_chunk
+
+            return None
+
+        def coordinated_expansions(
+            noun_chunk
+        ):
+            """
+            Expand coordinated modifiers generically.
+
+            Example grammatical pattern:
+            "state, tribal, and local governments"
+            can yield separate actor candidates ending in
+            the shared head noun. The logic depends only
+            on dependency structure, not on the words
+            state/tribal/local.
+            """
+            if noun_chunk is None:
+                return []
+
+            root = noun_chunk.root
+
+            if root.pos_ not in {
+                "NOUN",
+                "PROPN"
+            }:
+                return []
+
+            modifiers = []
+
+            for token in noun_chunk:
+                if (
+                    token.i >= root.i
+                    or token.is_stop
+                    or token.is_punct
+                ):
+                    continue
+
+                if (
+                    token.dep_
+                    in {
+                        "amod",
+                        "compound",
+                        "conj"
+                    }
+                    and token.pos_
+                    in {
+                        "ADJ",
+                        "NOUN",
+                        "PROPN"
+                    }
+                ):
+                    modifiers.append(
+                        token.text
+                    )
+
+            unique_modifiers = []
+
+            for modifier in modifiers:
+                modifier_key = (
+                    modifier.casefold()
+                )
+
+                if (
+                    modifier_key
+                    not in {
+                        value.casefold()
+                        for value
+                        in unique_modifiers
+                    }
+                ):
+                    unique_modifiers.append(
+                        modifier
+                    )
+
+            if len(
+                unique_modifiers
+            ) < 2:
+                return []
+
+            root_text = root.text
+
+            return [
+                clean_phrase(
+                    f"{modifier} {root_text}"
+                )
+                for modifier in (
+                    unique_modifiers
+                )
             ]
 
-            if not subtree_tokens:
-                return token.text
-
-            start_index = min(
-                subtree_token.i
-                for subtree_token
-                in subtree_tokens
+        def add_phrase_source(
+            phrase_sources,
+            phrase,
+            source_type,
+            noun_chunk=None
+        ):
+            cleaned = clean_phrase(
+                phrase
             )
 
-            end_index = max(
-                subtree_token.i
-                for subtree_token
-                in subtree_tokens
-            )
+            if cleaned:
+                phrase_sources.append(
+                    (
+                        cleaned,
+                        source_type
+                    )
+                )
 
-            return token.doc[
-                start_index:
-                end_index + 1
-            ].text
+            for expansion in (
+                coordinated_expansions(
+                    noun_chunk
+                )
+            ):
+                if expansion:
+                    phrase_sources.append(
+                        (
+                            expansion,
+                            (
+                                source_type
+                                + "_coordination"
+                            )
+                        )
+                    )
 
         for context_rank, row in enumerate(
-            policy_change_df.head(
-                12
+            policy_context_df.head(
+                18
             ).itertuples(
                 index=False
             )
@@ -2618,23 +2949,25 @@ class LegisBriefPipeline:
 
             phrase_sources = []
 
-            # Named actors are useful even when dependency
-            # parsing is imperfect.
+            # Named persons, organizations, governments,
+            # and demographic/national groups.
             for entity in document.ents:
                 if (
                     entity.label_
                     in allowed_entity_labels
                 ):
-                    phrase_sources.append(
-                        (
-                            entity.text,
-                            "named_entity"
-                        )
+                    add_phrase_source(
+                        phrase_sources,
+                        entity.text,
+                        "named_entity",
+                        None
                     )
 
-            # Subjects are the strongest general indicator
-            # of who has a duty, right, authority, or
-            # restriction in a legal provision.
+            # Grammatical subjects are the strongest
+            # actor signal. Use the noun chunk rather than
+            # the full dependency subtree so labels do not
+            # include relative clauses such as
+            # "employee who reports ...".
             for token in document:
                 if (
                     token.dep_
@@ -2645,19 +2978,30 @@ class LegisBriefPipeline:
                         "PROPN"
                     }
                 ):
-                    phrase_sources.append(
-                        (
-                            subtree_phrase(
-                                token
-                            ),
-                            "grammatical_subject"
+                    noun_chunk = (
+                        noun_chunk_for_token(
+                            document,
+                            token
                         )
                     )
 
-            # Beneficiaries, regulated parties, and targets
-            # frequently occur as objects of these
-            # prepositions: "to employees", "against an
-            # employee", "on an employer", "by the agency".
+                    phrase = (
+                        noun_chunk.text
+                        if noun_chunk
+                        is not None
+                        else token.text
+                    )
+
+                    add_phrase_source(
+                        phrase_sources,
+                        phrase,
+                        "grammatical_subject",
+                        noun_chunk
+                    )
+
+            # Beneficiaries, recipients, regulated parties,
+            # and targets frequently appear as objects of
+            # prepositions.
             for token in document:
                 if (
                     token.dep_
@@ -2673,55 +3017,56 @@ class LegisBriefPipeline:
                     .casefold()
                     in actor_prepositions
                 ):
-                    phrase_sources.append(
-                        (
-                            subtree_phrase(
-                                token
-                            ),
-                            "actor_prepositional_object"
+                    noun_chunk = (
+                        noun_chunk_for_token(
+                            document,
+                            token
                         )
                     )
 
-            # Direct/indirect objects are retained only
-            # when spaCy identifies the head as a named
-            # entity or person/organization noun phrase;
-            # the NLI actor test below remains the final
-            # semantic gate.
-            for noun_chunk in document.noun_chunks:
+                    phrase = (
+                        noun_chunk.text
+                        if noun_chunk
+                        is not None
+                        else token.text
+                    )
+
+                    add_phrase_source(
+                        phrase_sources,
+                        phrase,
+                        (
+                            "actor_prepositional_"
+                            "object"
+                        ),
+                        noun_chunk
+                    )
+
+            # Direct and indirect objects can also be
+            # legal beneficiaries or regulated actors.
+            # They are admitted as candidates, but cannot
+            # reach the final output unless the NLI tests
+            # identify them as an actual actor and assign
+            # a legal role.
+            for noun_chunk in (
+                document.noun_chunks
+            ):
                 root = noun_chunk.root
 
                 if (
                     root.dep_
-                    in {
-                        "dobj",
-                        "obj",
-                        "iobj",
-                        "dative",
-                        "agent"
-                    }
+                    in object_dependencies
                     and root.pos_
                     in {
                         "NOUN",
                         "PROPN"
                     }
                 ):
-                    entity_labels = {
-                        token.ent_type_
-                        for token
-                        in noun_chunk
-                        if token.ent_type_
-                    }
-
-                    if (
-                        entity_labels
-                        & allowed_entity_labels
-                    ):
-                        phrase_sources.append(
-                            (
-                                noun_chunk.text,
-                                "named_object"
-                            )
-                        )
+                    add_phrase_source(
+                        phrase_sources,
+                        noun_chunk.text,
+                        "grammatical_object",
+                        noun_chunk
+                    )
 
             seen_in_context = set()
 
@@ -2744,8 +3089,6 @@ class LegisBriefPipeline:
                 ):
                     continue
 
-                # Pronouns and legal-document references
-                # are not useful stakeholder labels.
                 if (
                     phrase.casefold()
                     in {
@@ -2844,7 +3187,7 @@ class LegisBriefPipeline:
         # Keep the number of NLI role checks bounded
         # while preserving candidates from different
         # policy contexts.
-        candidates = candidates[:36]
+        candidates = candidates[:56]
 
         type_premises = []
         type_hypotheses = []
@@ -2934,10 +3277,10 @@ class LegisBriefPipeline:
 
             if (
                 stakeholder_score
-                >= 0.50
+                >= 0.46
                 and stakeholder_score
                 >= abstract_score
-                + 0.08
+                + 0.10
             ):
                 accepted_candidates.append(
                     {
@@ -3071,7 +3414,7 @@ class LegisBriefPipeline:
             )
             if row[
                 "role_score"
-            ] >= 0.48
+            ] >= 0.44
         ]
 
         ranked.sort(
@@ -3680,9 +4023,33 @@ class LegisBriefPipeline:
             )
         )
 
+        stakeholder_context_df = (
+            self._select_diverse_policy_rows(
+                policy_df=policy_df,
+                minimum_items=min(
+                    5,
+                    max(
+                        1,
+                        len(
+                            policy_change_df
+                        )
+                    )
+                ),
+                maximum_items=12
+            )
+        )
+
+        if (
+            stakeholder_context_df is None
+            or stakeholder_context_df.empty
+        ):
+            stakeholder_context_df = (
+                policy_change_df
+            )
+
         affected_group_df = (
             self._classify_affected_groups(
-                policy_change_df
+                stakeholder_context_df
             )
         )
 
@@ -3779,7 +4146,7 @@ class LegisBriefPipeline:
             ),
             "generation_metadata": {
                 "pipeline_revision": (
-                    "source_grounded_v4"
+                    "source_grounded_v5"
                 ),
                 "bill_chunks": int(
                     draft_result[
