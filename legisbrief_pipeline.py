@@ -2078,7 +2078,6 @@ class LegisBriefPipeline:
             )
         )
 
-
     def _select_diverse_policy_rows(
         self,
         policy_df,
@@ -2091,20 +2090,11 @@ class LegisBriefPipeline:
         ):
             return pd.DataFrame()
 
-        substantive_mask = (
-            ~policy_df[
-                "source_sentence"
-            ].map(
-                self._is_short_title_sentence
-            )
-        )
-
         ranked = (
             policy_df.loc[
                 policy_df[
                     "is_policy"
                 ]
-                & substantive_mask
             ]
             .sort_values(
                 "selection_score",
@@ -2118,8 +2108,7 @@ class LegisBriefPipeline:
         if len(ranked) < minimum_items:
             relaxed = (
                 policy_df.loc[
-                    substantive_mask
-                    & (
+                    (
                         policy_df[
                             "complete_clause"
                         ]
@@ -2182,13 +2171,6 @@ class LegisBriefPipeline:
                     row.source_sentence
                 )
 
-                if (
-                    self._is_short_title_sentence(
-                        sentence
-                    )
-                ):
-                    continue
-
                 if any(
                     self.sentence_jaccard(
                         sentence,
@@ -2241,151 +2223,6 @@ class LegisBriefPipeline:
         return pd.DataFrame(
             selected_rows
         )
-    def _is_short_title_sentence(
-        sentence
-    ):
-        """
-        Return True for short-title/citation language.
-        These sentences identify the Act but do not
-        describe a substantive policy change.
-        """
-        text = (
-            LegisBriefPipeline
-            .normalize_text(
-                sentence
-            )
-            .casefold()
-        )
-
-        patterns = [
-            r"\bmay be cited as\b",
-            r"\bshall be cited as\b",
-            r"\bshort title\b",
-            r"\bthis act is entitled\b",
-            r"\bthe short title of this act\b"
-        ]
-
-        return any(
-            re.search(
-                pattern,
-                text
-            )
-            for pattern in patterns
-        )
-
-    @classmethod
-    def _safe_plain_english_transform(
-        cls,
-        sentence
-    ):
-        """
-        Apply only conservative legal-English
-        substitutions. This is used when the rewrite
-        model copies the source or when its rewrite
-        does not pass verification.
-        """
-        text = cls.ensure_sentence_ending(
-            sentence
-        )
-
-        replacements = [
-            (
-                r"\bshall not\b",
-                "must not"
-            ),
-            (
-                r"\bmay not\b",
-                "must not"
-            ),
-            (
-                r"\bshall\b",
-                "must"
-            ),
-            (
-                r"\bmay\b",
-                "can"
-            ),
-            (
-                r"\bnot later than\b",
-                "within"
-            ),
-            (
-                r"\bprior to\b",
-                "before"
-            ),
-            (
-                r"\bpursuant to\b",
-                "under"
-            ),
-            (
-                r"\bin accordance with\b",
-                "under"
-            ),
-            (
-                r"\bcommence\b",
-                "begin"
-            ),
-            (
-                r"\bterminate\b",
-                "end"
-            ),
-            (
-                r"\butilize\b",
-                "use"
-            )
-        ]
-
-        for pattern, replacement in replacements:
-            text = re.sub(
-                pattern,
-                replacement,
-                text,
-                flags=re.IGNORECASE
-            )
-
-        text = re.sub(
-            r"^This Act requires\b",
-            "The bill requires",
-            text,
-            flags=re.IGNORECASE
-        )
-
-        text = re.sub(
-            r"^This Act\b",
-            "The bill",
-            text,
-            flags=re.IGNORECASE
-        )
-
-        return cls.ensure_sentence_ending(
-            text
-        )
-
-    @staticmethod
-    def _policy_change_display_text(
-        policy_function,
-        sentence
-    ):
-        """
-        Keep the source-grounded provision but give the
-        bullet a clear functional label. This makes the
-        policy-change section structurally different from
-        the prose summary.
-        """
-        label = str(
-            policy_function
-            or "Policy change"
-        ).strip()
-
-        sentence = (
-            LegisBriefPipeline
-            .ensure_sentence_ending(
-                sentence
-            )
-        )
-
-        return f"{label}: {sentence}"
-
 
     def _source_fallback_rows(
         self,
@@ -2411,9 +2248,6 @@ class LegisBriefPipeline:
             and self._has_complete_clause(
                 sentence
             )
-            and not self._is_short_title_sentence(
-                sentence
-            )
         ]
 
         if not sentences:
@@ -2424,13 +2258,8 @@ class LegisBriefPipeline:
                 for sentence in (
                     self.split_sentences(
                         bill_text
-                    )
+                    )[:count]
                 )
-                if not self._is_short_title_sentence(
-                    sentence
-                )
-            ][
-                :count
             ]
 
         if len(sentences) <= count:
@@ -2488,24 +2317,6 @@ class LegisBriefPipeline:
         bill_text,
         selected_policy_df
     ):
-        if (
-            selected_policy_df is not None
-            and not selected_policy_df.empty
-        ):
-            selected_policy_df = (
-                selected_policy_df.loc[
-                    ~selected_policy_df[
-                        "source_sentence"
-                    ].map(
-                        self._is_short_title_sentence
-                    )
-                ]
-                .copy()
-                .reset_index(
-                    drop=True
-                )
-            )
-
         if (
             selected_policy_df is None
             or selected_policy_df.empty
@@ -2565,9 +2376,6 @@ class LegisBriefPipeline:
                     "source_sentence"
                 ].tolist()
             )
-            if not self._is_short_title_sentence(
-                sentence
-            )
         ]
 
         return (
@@ -2582,136 +2390,36 @@ class LegisBriefPipeline:
         policy_df,
         summary_policy_df
     ):
-        summary_sentences = []
+        rows = []
 
         if (
             summary_policy_df is not None
             and not summary_policy_df.empty
         ):
-            summary_sentences = [
-                self.ensure_sentence_ending(
-                    sentence
+            rows.extend(
+                summary_policy_df.to_dict(
+                    orient="records"
                 )
-                for sentence in (
-                    summary_policy_df[
-                        "source_sentence"
-                    ].tolist()
-                )
-                if not self._is_short_title_sentence(
-                    sentence
-                )
-            ]
-
-        policy_rows = []
+            )
 
         if (
             policy_df is not None
             and not policy_df.empty
         ):
-            substantive_mask = (
-                ~policy_df[
-                    "source_sentence"
-                ].map(
-                    self._is_short_title_sentence
-                )
-            )
-
-            strict_rows = (
+            rows.extend(
                 policy_df.loc[
                     policy_df[
                         "is_policy"
                     ]
-                    & substantive_mask
                 ]
                 .sort_values(
                     "selection_score",
                     ascending=False
-                )
-            )
-
-            relaxed_rows = (
-                policy_df.loc[
-                    substantive_mask
-                    & (
-                        policy_df[
-                            "complete_clause"
-                        ]
-                    )
-                    & (
-                        policy_df[
-                            "policy_entailment"
-                        ]
-                        >= 0.30
-                    )
-                    & (
-                        policy_df[
-                            "non_policy_entailment"
-                        ]
-                        < 0.62
-                    )
-                ]
-                .sort_values(
-                    "selection_score",
-                    ascending=False
-                )
-            )
-
-            policy_rows = (
-                pd.concat(
-                    [
-                        strict_rows,
-                        relaxed_rows
-                    ],
-                    ignore_index=True
-                )
-                .drop_duplicates(
-                    subset=[
-                        "source_sentence"
-                    ]
                 )
                 .to_dict(
                     orient="records"
                 )
             )
-
-        # Prefer provisions that are not already used
-        # verbatim in the summary. Summary rows are kept
-        # only as a fallback for very short bills.
-        fresh_rows = []
-        overlapping_rows = []
-
-        for row in policy_rows:
-            sentence = (
-                self.ensure_sentence_ending(
-                    row[
-                        "source_sentence"
-                    ]
-                )
-            )
-
-            overlaps_summary = any(
-                self.sentence_jaccard(
-                    sentence,
-                    summary_sentence
-                )
-                >= 0.82
-                for summary_sentence
-                in summary_sentences
-            )
-
-            if overlaps_summary:
-                overlapping_rows.append(
-                    row
-                )
-            else:
-                fresh_rows.append(
-                    row
-                )
-
-        rows = (
-            fresh_rows
-            + overlapping_rows
-        )
 
         selected = []
         selected_sentences = []
@@ -2725,13 +2433,6 @@ class LegisBriefPipeline:
                     ]
                 )
             )
-
-            if (
-                self._is_short_title_sentence(
-                    sentence
-                )
-            ):
-                continue
 
             if any(
                 self.sentence_jaccard(
@@ -2751,6 +2452,9 @@ class LegisBriefPipeline:
                 )
             )
 
+            # Prefer function diversity first, but
+            # allow a second provision from the same
+            # function when it adds distinct content.
             if (
                 functions[
                     policy_function
@@ -2761,10 +2465,7 @@ class LegisBriefPipeline:
             selected.append(
                 {
                     "policy_change": (
-                        self._policy_change_display_text(
-                            policy_function,
-                            sentence
-                        )
+                        sentence
                     ),
                     "policy_function": (
                         policy_function
@@ -2795,72 +2496,10 @@ class LegisBriefPipeline:
             ):
                 break
 
-        # Very short bills can have all policy provisions
-        # already present in the summary. In that case,
-        # preserve the structured labels so this section
-        # is still distinct from summary prose.
-        if (
-            not selected
-            and summary_policy_df is not None
-            and not summary_policy_df.empty
-        ):
-            for row in summary_policy_df.to_dict(
-                orient="records"
-            ):
-                sentence = (
-                    self.ensure_sentence_ending(
-                        row[
-                            "source_sentence"
-                        ]
-                    )
-                )
-
-                if (
-                    self._is_short_title_sentence(
-                        sentence
-                    )
-                ):
-                    continue
-
-                policy_function = str(
-                    row.get(
-                        "policy_function",
-                        "Policy change"
-                    )
-                )
-
-                selected.append(
-                    {
-                        "policy_change": (
-                            self._policy_change_display_text(
-                                policy_function,
-                                sentence
-                            )
-                        ),
-                        "policy_function": (
-                            policy_function
-                        ),
-                        "source_sentence": (
-                            sentence
-                        ),
-                        "support_score": float(
-                            row.get(
-                                "policy_entailment",
-                                1.0
-                            )
-                        )
-                    }
-                )
-
-                if (
-                    len(selected)
-                    >= self.maximum_policy_changes
-                ):
-                    break
-
         return pd.DataFrame(
             selected
         )
+
     def _collect_stakeholder_candidates(
         self,
         policy_change_df
@@ -3712,7 +3351,6 @@ class LegisBriefPipeline:
 
         return rewrites
 
-
     def _create_plain_english_explanation(
         self,
         summary_policy_df
@@ -3735,11 +3373,11 @@ class LegisBriefPipeline:
                     "source_sentence"
                 ].tolist()
             )
-            if not self._is_short_title_sentence(
-                sentence
-            )
         ]
 
+        # Release the NLI model before loading the
+        # plain-English model to lower peak memory on
+        # Streamlit Community Cloud.
         self._release_model(
             "nli"
         )
@@ -3757,7 +3395,7 @@ class LegisBriefPipeline:
             source_sentences,
             rewrites
         ):
-            rewrite_verification = (
+            verification = (
                 self._verify_rewrite(
                     source_sentence=(
                         source_sentence
@@ -3768,85 +3406,11 @@ class LegisBriefPipeline:
                 )
             )
 
-            rewrite_similarity = (
-                SequenceMatcher(
-                    None,
-                    self.normalize_text(
-                        source_sentence
-                    ).casefold(),
-                    self.normalize_text(
-                        rewrite
-                    ).casefold()
-                ).ratio()
-            )
-
-            safe_rewrite = (
-                self._safe_plain_english_transform(
-                    source_sentence
-                )
-            )
-
-            safe_changed = (
-                self.normalize_text(
-                    safe_rewrite
-                ).casefold()
-                != self.normalize_text(
-                    source_sentence
-                ).casefold()
-            )
-
-            safe_verification = None
-
-            if safe_changed:
-                safe_verification = (
-                    self._verify_rewrite(
-                        source_sentence=(
-                            source_sentence
-                        ),
-                        rewritten_sentence=(
-                            safe_rewrite
-                        )
-                    )
-                )
-
-            if (
-                rewrite_verification[
-                    "accepted"
-                ]
-                and rewrite_similarity
-                < 0.94
-            ):
-                final_sentence = rewrite
-                fallback_used = False
-                rewrite_source = (
-                    "generated_rewrite"
-                )
-
-            elif (
-                safe_changed
-                and safe_verification
-                is not None
-                and safe_verification[
-                    "accepted"
-                ]
-            ):
-                final_sentence = (
-                    safe_rewrite
-                )
-
-                fallback_used = False
-                rewrite_source = (
-                    "safe_plain_transform"
-                )
-
-            elif rewrite_verification[
+            if verification[
                 "accepted"
             ]:
                 final_sentence = rewrite
                 fallback_used = False
-                rewrite_source = (
-                    "generated_rewrite_close_to_source"
-                )
 
             else:
                 final_sentence = (
@@ -3854,9 +3418,6 @@ class LegisBriefPipeline:
                 )
 
                 fallback_used = True
-                rewrite_source = (
-                    "source_fallback"
-                )
 
             final_sentences.append(
                 final_sentence
@@ -3868,32 +3429,20 @@ class LegisBriefPipeline:
                         source_sentence
                     ),
                     "rewrite": rewrite,
-                    "safe_rewrite": (
-                        safe_rewrite
-                    ),
                     "final_sentence": (
                         final_sentence
                     ),
                     "entailment": round(
-                        rewrite_verification[
+                        verification[
                             "entailment"
                         ],
                         4
                     ),
                     "contradiction": round(
-                        rewrite_verification[
+                        verification[
                             "contradiction"
                         ],
                         4
-                    ),
-                    "rewrite_similarity": round(
-                        float(
-                            rewrite_similarity
-                        ),
-                        4
-                    ),
-                    "rewrite_source": (
-                        rewrite_source
                     ),
                     "fallback_used": (
                         fallback_used
@@ -3907,6 +3456,7 @@ class LegisBriefPipeline:
             ),
             "details": details
         }
+
     def _filter_similar_bills(
         self,
         result_df,
@@ -4229,7 +3779,7 @@ class LegisBriefPipeline:
             ),
             "generation_metadata": {
                 "pipeline_revision": (
-                    "source_grounded_v4_distinct_outputs"
+                    "source_grounded_v4"
                 ),
                 "bill_chunks": int(
                     draft_result[
